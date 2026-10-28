@@ -3,10 +3,9 @@
 from __future__ import annotations
 
 from collections import deque
-from pathlib import Path
 
-from PySide6.QtCore import QPoint, QRect, QRectF, QSize, Qt, QTimer
-from PySide6.QtGui import QColor, QImage, QPainter, QPainterPath, QPen, QPolygonF
+from PySide6.QtCore import QPoint, QPointF, QRect, QRectF, Qt, QTimer
+from PySide6.QtGui import QColor, QCursor, QImage, QPainter, QPainterPath, QPen, QPolygonF, QPixmap
 from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
@@ -21,6 +20,7 @@ from PySide6.QtWidgets import (
 
 from .model import PetState
 from .store import PetStore
+from .sprites import SLEEP_TICK_MS, load_library, make_sleep_loop
 
 
 class CatCanvas(QWidget):
@@ -30,12 +30,12 @@ class CatCanvas(QWidget):
     FRAME_HEIGHT = 208
     IDLE_TICK_MS = 140
     WALK_TICK_MS = 110
-    SLEEP_TICK_MS = 420
-    IDLE_TIMELINE = (0,) * 15 + (1, 2, 3, 4) + (5,) * 15 + (6,) * 15
+    SLEEP_TICK_MS = SLEEP_TICK_MS
+    IDLE_TIMELINE = (0,) * 15 + (1, 2, 3, 4) + (5,) * 15
     WALK_TIMELINE = tuple(range(8))
     ACTION_TICK_MS = 130
     _FRAME_CACHE: tuple[
-        list[QImage], list[QImage], list[QImage], dict[str, list[QImage]]
+        list[QPixmap], list[QPixmap], list[QPixmap], dict[str, list[QPixmap]]
     ] | None = None
 
     def __init__(self, parent: QWidget | None = None) -> None:
@@ -44,11 +44,16 @@ class CatCanvas(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         self.setMinimumSize(180, 188)
         if self._FRAME_CACHE is None:
+            library, _, _, _ = load_library(self._remove_edge_background)
+            if not library.get("sleep"):
+                library["sleep"] = [QPixmap.fromImage(frame) for frame in self._make_sleep_frames()]
+            else:
+                library["sleep"] = make_sleep_loop(library["sleep"][0])
             self.__class__._FRAME_CACHE = (
-                self._load_idle_frames(),
-                self._load_walk_frames(self.FRAME_HEIGHT),
-                self._load_walk_frames(self.FRAME_HEIGHT * 2),
-                self._load_action_frames(),
+                library.pop("idle"),
+                library.pop("walk_right"),
+                library.pop("walk_left"),
+                library,
             )
         self._frames, self._walk_frames, self._walk_frames_left, self._action_frames = (
             self._FRAME_CACHE
@@ -57,6 +62,8 @@ class CatCanvas(QWidget):
         self.animation_direction = "right"
         self.animation_state = "idle"
         self._action_name = ""
+        self._gaze = QPointF()
+        self._gaze_frame = 0
         self._timeline_index = 0
         self._frame_index = 0
         self._timer = QTimer(self)
@@ -68,108 +75,6 @@ class CatCanvas(QWidget):
         if self._frames:
             self._timer.start()
 
-    def _load_idle_frames(self) -> list[QImage]:
-        assets = Path(__file__).resolve().parents[2] / "assets"
-        frames: list[QImage] = []
-
-        # The first row of the transparent atlas contains six idle poses,
-        # including a blink frame.
-        idle_sheet = QImage(str(assets / "calico_spritesheet.png"))
-        if not idle_sheet.isNull() and idle_sheet.hasAlphaChannel():
-            for column in range(6):
-                cell = idle_sheet.copy(
-                    QRect(column * self.FRAME_WIDTH, 0, self.FRAME_WIDTH, self.FRAME_HEIGHT)
-                )
-                frame = self._fit_frame(cell)
-                if not frame.isNull():
-                    frames.append(frame)
-
-        # The second sheet's neutral cell has a white matte; remove the
-        # edge-connected matte so it can be composited on the desktop.
-        pose_sheet = QImage(str(assets / "calico_pose_sheet.png"))
-        if not pose_sheet.isNull() and pose_sheet.width() >= self.FRAME_WIDTH:
-            neutral = pose_sheet.copy(QRect(18, 48, 160, 180))
-            neutral = self._remove_edge_background(neutral)
-            frame = self._fit_frame(neutral)
-            if not frame.isNull():
-                frames.append(frame)
-        return frames
-
-    def _load_walk_frames(self, row_y: int) -> list[QImage]:
-        assets = Path(__file__).resolve().parents[2] / "assets"
-        sheet = QImage(str(assets / "calico_spritesheet.png"))
-        if sheet.isNull() or not sheet.hasAlphaChannel():
-            return []
-
-        frames: list[QImage] = []
-        for column in range(8):
-            cell = sheet.copy(
-                QRect(column * self.FRAME_WIDTH, row_y, self.FRAME_WIDTH, self.FRAME_HEIGHT)
-            )
-            frame = self._fit_frame(cell, QSize(176, 132))
-            if not frame.isNull():
-                frames.append(frame)
-        return frames
-
-    def _load_action_frames(self) -> dict[str, list[QImage]]:
-        """Load the remaining atlas rows as short interaction animations."""
-        assets = Path(__file__).resolve().parents[2] / "assets"
-        sheet = QImage(str(assets / "calico_spritesheet.png"))
-        actions: dict[str, list[QImage]] = {}
-        if not sheet.isNull() and sheet.hasAlphaChannel():
-            for name, row, count in (
-                ("paw", 3, 4),
-                ("bounce", 4, 5),
-                ("blink", 5, 8),
-                ("tilt", 6, 6),
-                ("knead", 7, 6),
-                # The atlas artwork has these two rows in the opposite
-                # order to the menu labels: row 9 looks upward and row 8
-                # looks downward.
-                ("look_up", 9, 8),
-                ("look_down", 8, 8),
-                ("look_side", 10, 8),
-            ):
-                frames: list[QImage] = []
-                for column in range(count):
-                    vertical_offset = 0
-                    if name == "bounce":
-                        # Preserve the take-off / airborne / landing arc
-                        # after cropping each source cell to its subject.
-                        vertical_offset = (0, -12, -28, -18, 0)[column]
-                    frame = self._fit_frame(
-                        sheet.copy(QRect(column * self.FRAME_WIDTH, row * self.FRAME_HEIGHT, self.FRAME_WIDTH, self.FRAME_HEIGHT)),
-                        QSize(128, 158),
-                        vertical_offset=vertical_offset,
-                    )
-                    if not frame.isNull():
-                        frames.append(frame)
-                actions[name] = frames
-
-            # Sleep is a calm closed-eye loop, not the kneading row. Reuse
-            # only the closed-eye middle of the blink sequence so the cat
-            # does not keep moving its paws while asleep.
-            blink_frames = actions.get("blink", [])
-            if blink_frames:
-                closed = blink_frames[2:6] or blink_frames
-                actions["sleep"] = [closed[0], *closed[1:], closed[-2], closed[-1]]
-
-        pose_sheet = QImage(str(assets / "calico_pose_sheet.png"))
-        if not pose_sheet.isNull():
-            for name, rows in (("turn_around", (1, 2)), ("zoom_turn", (3, 4))):
-                frames = []
-                for row in rows:
-                    for column in range(8):
-                        cell = pose_sheet.copy(
-                            QRect(column * self.FRAME_WIDTH, row * 234 + 24, self.FRAME_WIDTH, 210)
-                        )
-                        frame = self._fit_frame(
-                            self._remove_edge_background(cell), QSize(128, 158)
-                        )
-                        if not frame.isNull():
-                            frames.append(frame)
-                actions[name] = frames
-        return actions
 
     @staticmethod
     def _remove_edge_background(image: QImage) -> QImage:
@@ -205,43 +110,49 @@ class CatCanvas(QWidget):
                     enqueue(nx, ny)
         return result
 
-    def _fit_frame(
-        self,
-        image: QImage,
-        max_size: QSize | None = None,
-        *,
-        vertical_offset: int = 0,
-    ) -> QImage:
-        image = image.convertToFormat(QImage.Format.Format_ARGB32)
-        left, top = image.width(), image.height()
-        right = bottom = -1
-        for y in range(image.height()):
-            for x in range(image.width()):
-                if image.pixelColor(x, y).alpha() > 8:
-                    left = min(left, x)
-                    top = min(top, y)
-                    right = max(right, x)
-                    bottom = max(bottom, y)
-        if right < left or bottom < top:
-            return QImage()
 
-        cropped = image.copy(QRect(left, top, right - left + 1, bottom - top + 1))
-        scaled = cropped.scaled(
-            max_size or QSize(128, 158),
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
-        )
-        canvas = QImage(self.FRAME_WIDTH, self.FRAME_HEIGHT, QImage.Format.Format_ARGB32)
-        canvas.fill(Qt.GlobalColor.transparent)
-        painter = QPainter(canvas)
-        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
-        painter.drawImage(
-            (self.FRAME_WIDTH - scaled.width()) // 2,
-            self.FRAME_HEIGHT - scaled.height() - 7 + vertical_offset,
-            scaled,
-        )
-        painter.end()
-        return canvas
+    def _make_sleep_frames(self) -> list[QImage]:
+        frames = []
+        for phase in (0, 1, 2, 1, 0, -1):
+            image = QImage(self.FRAME_WIDTH, self.FRAME_HEIGHT, QImage.Format.Format_ARGB32)
+            image.fill(Qt.GlobalColor.transparent)
+            painter = QPainter(image)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            painter.setPen(QPen(QColor("#694c40"), 3, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+            painter.setBrush(QColor("#fffaf2"))
+            painter.drawEllipse(QRectF(72, 112 + phase, 103, 58))
+            painter.setBrush(QColor("#e8943f"))
+            painter.drawEllipse(QRectF(87, 119 + phase, 39, 39))
+            painter.setBrush(QColor("#302622"))
+            painter.drawEllipse(QRectF(129, 120 + phase, 34, 37))
+            painter.setBrush(QColor("#fffaf2"))
+            painter.drawEllipse(QRectF(27, 91 + phase, 69, 65))
+            painter.setBrush(QColor("#e8943f"))
+            painter.drawPolygon(QPolygonF([QPoint(31, 112 + phase), QPoint(37, 77 + phase), QPoint(58, 103 + phase)]))
+            painter.setBrush(QColor("#302622"))
+            painter.drawPolygon(QPolygonF([QPoint(69, 104 + phase), QPoint(92, 78 + phase), QPoint(95, 116 + phase)]))
+            painter.setBrush(QColor("#d88481"))
+            painter.drawEllipse(QRectF(57, 122 + phase, 8, 5))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawArc(QRectF(42, 119 + phase, 15, 10), 15 * 16, 150 * 16)
+            painter.drawArc(QRectF(66, 119 + phase, 15, 10), 15 * 16, 150 * 16)
+            painter.setPen(QPen(QColor("#b86224"), 13, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+            tail = QPainterPath(QPointF(162, 144 + phase))
+            tail.cubicTo(185, 139 + phase, 183, 109 + phase, 165, 111 + phase)
+            painter.drawPath(tail)
+            painter.end()
+            frames.append(image)
+        return frames
+
+    def set_gaze(self, point: QPointF) -> None:
+        self._gaze = QPointF(max(-1.0, min(1.0, point.x())), max(-1.0, min(1.0, point.y())))
+        if self._action_frames.get("turn_around"):
+            import math
+
+            angle = math.atan2(self._gaze.y(), self._gaze.x())
+            self._gaze_frame = round(((angle + math.pi / 2) % (2 * math.pi)) * 16 / (2 * math.pi)) % 16
+        if self.animation_state in {"idle", "walking"}:
+            self.update()
 
     def _advance_animation_frame(self) -> None:
         if self.animation_state == "action":
@@ -339,19 +250,18 @@ class CatCanvas(QWidget):
         if self.animation_state == "walking" and not frames:
             frames = self._frames
         if frames:
-            image = frames[min(self._frame_index, len(frames) - 1)]
-            scaled = image.scaled(
-                QSize(max(1, self.width() - 8), max(1, self.height() - 4)),
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation,
-            )
+            gaze_frames = self._action_frames.get("turn_around", [])
+            if self.animation_state == "idle" and gaze_frames and max(abs(self._gaze.x()), abs(self._gaze.y())) > 0.15:
+                image = gaze_frames[self._gaze_frame % len(gaze_frames)]
+            else:
+                image = frames[min(self._frame_index, len(frames) - 1)]
             target = QRectF(
-                (self.width() - scaled.width()) / 2,
-                (self.height() - scaled.height()) / 2,
-                scaled.width(),
-                scaled.height(),
+                (self.width() - self.FRAME_WIDTH) / 2,
+                (self.height() - self.FRAME_HEIGHT) / 2,
+                self.FRAME_WIDTH,
+                self.FRAME_HEIGHT,
             )
-            painter.drawImage(target, scaled)
+            painter.drawPixmap(target.toRect(), image)
         else:
             self._paint_fallback(painter)
 
@@ -461,9 +371,9 @@ class PetWindow(QWidget):
         self.setWindowTitle(state.name)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
-        self.setMinimumSize(192, 226)
-        self.resize(192, 226)
+        self.setFixedSize(192, 242)
         self.setCursor(Qt.CursorShape.OpenHandCursor)
+        self.setMouseTracking(True)
         self._press_global: QPoint | None = None
         self._press_pos: QPoint | None = None
         self._dragged = False
@@ -503,7 +413,22 @@ class PetWindow(QWidget):
         self._timer.setInterval(60_000)
         self._timer.timeout.connect(self._tick)
         self._timer.start()
+        self._gaze_timer = QTimer(self)
+        self._gaze_timer.setInterval(80)
+        self._gaze_timer.timeout.connect(self._update_gaze)
+        self._gaze_timer.start()
         self._tick()
+
+    def _update_gaze(self) -> None:
+        if self.state.sleeping or self.cat.animation_state in {"action", "walking"}:
+            return
+        local = self.mapFromGlobal(QCursor.pos())
+        self.cat.set_gaze(
+            QPointF(
+                (local.x() / max(1, self.width()) - 0.5) * 2,
+                (local.y() / max(1, self.height()) - 0.5) * 2,
+            )
+        )
 
     def _position_window(self) -> None:
         screens = list(__import__("PySide6.QtGui", fromlist=["QGuiApplication"]).QGuiApplication.screens())
@@ -585,6 +510,12 @@ class PetWindow(QWidget):
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event) -> None:  # noqa: N802 - Qt override name
+        if not self.state.sleeping and self._press_global is None:
+            local = event.position()
+            self.cat.set_gaze(
+                QPointF((local.x() / max(1, self.width()) - 0.5) * 2,
+                        (local.y() / max(1, self.height()) - 0.5) * 2)
+            )
         if self._press_global is not None and self._press_pos is not None:
             delta = event.globalPosition().toPoint() - self._press_global
             if delta.manhattanLength() > 4:
@@ -604,6 +535,7 @@ class PetWindow(QWidget):
         if event.button() == Qt.MouseButton.LeftButton and self._press_global is not None:
             if not self._dragged:
                 self._act(self.state.pet, "呼噜呼噜~", "paw")
+                self.cat.set_gaze(QPointF())
             else:
                 self._walk_timer.stop()
                 if not self.state.sleeping:

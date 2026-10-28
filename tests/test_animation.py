@@ -5,6 +5,8 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtWidgets import QApplication
 from PySide6.QtTest import QTest
+from PySide6.QtCore import QPointF
+from PySide6.QtGui import QImage, QPainter
 
 from calico_pet.window import CatCanvas
 
@@ -22,7 +24,7 @@ class CatAnimationTests(unittest.TestCase):
         self.canvas.deleteLater()
 
     def test_sprite_sheet_contains_idle_and_walk_frames(self) -> None:
-        self.assertEqual(len(self.canvas._frames), 7)
+        self.assertEqual(len(self.canvas._frames), 6)
         self.assertEqual(len(self.canvas._walk_frames), 8)
         self.assertEqual(len(self.canvas._walk_frames_left), 8)
         self.assertEqual(
@@ -39,7 +41,7 @@ class CatAnimationTests(unittest.TestCase):
             + len(self.canvas._walk_frames)
             + len(self.canvas._walk_frames_left)
             + sum(map(len, self.canvas._action_frames.values())),
-            112,
+            137,
         )
 
         # The atlas rows are intentionally mapped to the visual direction,
@@ -48,15 +50,32 @@ class CatAnimationTests(unittest.TestCase):
         self.assertEqual(len(self.canvas._action_frames["look_down"]), 6)
 
     def test_sleep_is_closed_eye_loop_and_knead_is_separate(self) -> None:
-        self.assertEqual(len(self.canvas._action_frames["sleep"]), 6)
+        self.assertEqual(len(self.canvas._action_frames["sleep"]), 32)
         self.assertEqual(len(self.canvas._action_frames["knead"]), 6)
         self.assertNotEqual(
             [frame.cacheKey() for frame in self.canvas._action_frames["sleep"]],
             [frame.cacheKey() for frame in self.canvas._action_frames["knead"]],
         )
+        sleep = self.canvas._action_frames["sleep"][0].toImage()
+        xs, ys = [], []
+        for y in range(sleep.height()):
+            for x in range(sleep.width()):
+                if sleep.pixelColor(x, y).alpha() > 8:
+                    xs.append(x)
+                    ys.append(y)
+        self.assertGreater(max(xs) - min(xs), max(ys) - min(ys))
+
+    def test_cursor_gaze_is_clamped_and_disabled_while_sleeping(self) -> None:
+        self.canvas.set_gaze(QPointF(4, -3))
+        self.assertEqual(self.canvas._gaze, QPointF(1, -1))
+        self.canvas.set_animation_state("sleeping")
+        self.canvas.set_gaze(QPointF(-1, 1))
+        self.assertEqual(self.canvas._gaze, QPointF(-1, 1))
+        self.assertEqual(self.canvas.animation_state, "sleeping")
 
     def test_bounce_has_a_visible_upward_arc(self) -> None:
         def top(frame):
+            frame = frame.toImage()
             return next(
                 y
                 for y in range(frame.height())
@@ -67,8 +86,45 @@ class CatAnimationTests(unittest.TestCase):
         self.assertLess(tops[2], tops[0])
         self.assertLess(tops[2], tops[-1])
 
+    def test_paw_and_sleep_render_only_the_cached_sprite(self):
+        self.canvas.resize(192, 208)
+        self.canvas.show()
+        self.app.processEvents()
+        for state in ("paw", "sleeping"):
+            if state == "paw":
+                self.canvas.play_action("paw")
+                frames = self.canvas._action_frames["paw"]
+            else:
+                self.canvas.set_animation_state("sleeping")
+                frames = self.canvas._action_frames["sleep"]
+            self.canvas._timer.stop()
+            for index, expected in enumerate(frames):
+                self.canvas._frame_index = index
+                actual = QImage(192, 208, QImage.Format.Format_ARGB32)
+                actual.fill(0)
+                painter = QPainter(actual)
+                self.canvas.render(painter, self.canvas.rect().topLeft())
+                painter.end()
+                reference = QImage(192, 208, QImage.Format.Format_ARGB32)
+                reference.fill(0)
+                painter = QPainter(reference)
+                painter.drawPixmap(0, 0, expected)
+                painter.end()
+                self.assertEqual(actual,
+                                 reference,
+                                 (state, index))
+
+    def test_sleep_breath_has_small_motion_and_smooth_wrap(self):
+        from calico_pet.sprites import bounds, pixels
+        frames = self.canvas._action_frames["sleep"]
+        boxes = [bounds(pixels(frame.toImage())) for frame in frames]
+        self.assertEqual(len({(b[0], b[2], b[3]) for b in boxes}), 1)
+        self.assertLessEqual(max(b[1] for b in boxes)-min(b[1] for b in boxes), 3)
+        self.assertGreater(max(b[1] for b in boxes)-min(b[1] for b in boxes), 0)
+        self.assertLessEqual(abs(boxes[-1][1]-boxes[0][1]), 1)
+
     def test_pose_sheet_matte_is_removed(self) -> None:
-        neutral = self.canvas._frames[-1]
+        neutral = self.canvas._action_frames["turn_around"][0].toImage()
         for point in ((35, 60), (150, 60), (35, 190), (150, 190)):
             self.assertEqual(neutral.pixelColor(*point).alpha(), 0)
         self.assertGreater(neutral.pixelColor(96, 130).alpha(), 0)
