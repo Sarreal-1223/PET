@@ -4,6 +4,28 @@
 
 ## 启动
 
+普通 Windows 用户使用 `release/CalicoPet-Windows-v0.1.0.zip`，全部解压后双击
+`CalicoPet.exe`。无需安装开发工具，详细操作见包内中文使用说明。
+
+### 构建 Windows 发行版
+
+在 Windows x64 上安装 Python 3.12 和 uv 后执行：
+
+```powershell
+uv sync
+uv pip install --python .venv/Scripts/python.exe pyinstaller==6.16.0
+powershell -NoProfile -ExecutionPolicy Bypass -File .\build.ps1
+# onedir 验收成功后再构建单文件版本
+powershell -NoProfile -ExecutionPolicy Bypass -File .\build.ps1 -OneFile
+```
+
+入口为 `packaging/launcher.py`，正常启动调用 `calico_pet.app:main`。
+spec 仅收集 assets 下的 PNG，GUI 不显示控制台。存档仍保存在当前 Windows
+用户的应用数据目录，发行包不包含个人存档。构建脚本在中文路径、移除开发
+工具 PATH 的环境中自动验证原生 Windows Qt 启动、动画、菜单和存档读写，
+报告位于 `build/verification/<模式>/result.json`。此检查不等同于全新虚拟机
+或真人视觉验收。构建产物位于已忽略的 build、dist、release 目录。
+
 先安装 [uv](https://docs.astral.sh/uv/)，然后在项目目录运行：
 
 ```powershell

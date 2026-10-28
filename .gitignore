@@ -5,6 +5,8 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+release/
+pet_state.json
 .pytest_cache/
 .ruff_cache/
 .idea/

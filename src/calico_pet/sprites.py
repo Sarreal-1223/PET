@@ -3,13 +3,15 @@ from __future__ import annotations
 
 import json
 import math
+import sys
 from pathlib import Path
 from statistics import median
 
 from PySide6.QtCore import QRect, Qt
 from PySide6.QtGui import QColor, QImage, QPainter, QPixmap
 
-ASSETS = Path(__file__).resolve().parents[2] / "assets"
+ASSETS = (Path(sys._MEIPASS) if getattr(sys, "frozen", False)
+          else Path(__file__).resolve().parents[2]) / "assets"
 CANVAS = (192, 208)
 ANCHOR = (96, 201)
 SLEEP_FRAME_COUNT = 32
